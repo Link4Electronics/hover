@@ -1,6 +1,6 @@
 /* Multiplayer seats and views: mp.c. */
 #pragma once
-#include <windows.h>
+#include "hover_port.h"
 #include <stdint.h>
 #include "recomp_types.h"
 

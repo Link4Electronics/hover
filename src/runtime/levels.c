@@ -16,7 +16,7 @@
  * and so on, up to MAX_SAVED.
  */
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hover_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,7 +225,7 @@ static void clip_put(const char* s) {
     if (!g) return;
     memcpy(GlobalLock(g), s, n);
     GlobalUnlock(g);
-    if (OpenClipboard(NULL)) {
+    if (OpenClipboard(0)) {
         EmptyClipboard();
         if (!SetClipboardData(CF_TEXT, g)) GlobalFree(g);
         CloseClipboard();
@@ -234,7 +234,7 @@ static void clip_put(const char* s) {
 
 static int clip_get(char* out, size_t n) {
     int ok = 0;
-    if (!OpenClipboard(NULL)) return 0;
+    if (!OpenClipboard(0)) return 0;
     HANDLE h = GetClipboardData(CF_TEXT);
     const char* p = h ? (const char*)GlobalLock(h) : NULL;
     if (p) {

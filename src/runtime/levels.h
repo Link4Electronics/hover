@@ -1,6 +1,6 @@
 /* Level seeds: levels.c. */
 #pragma once
-#include <windows.h>
+#include "hover_port.h"
 #include <stdint.h>
 
 void     levels_init(const char* ini, uint32_t cli_seed, int cli_pinned);

@@ -30,8 +30,7 @@
  * class), with their own powerups, radar and sounds.
  */
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <xinput.h>
+#include "hover_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

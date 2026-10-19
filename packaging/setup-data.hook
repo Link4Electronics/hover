@@ -1,0 +1,59 @@
+# Sourced by the AppImage AppRun at startup: sharun sources every
+# AppDir/bin/*.hook before handing control to the game.
+#
+# The host resolves the guest's C: drive against its working directory (--game,
+# default: the checkout's game/ folder, or the current directory when the game
+# files are directly in it) and then chdirs into the game folder, because the
+# game opens Sounds\..., mazes\... and so on relative to the current directory
+# -- and the AppImage itself is mounted read-only, hence this hook: start in
+# the per-user directory and say what belongs there.
+dir="${DATADIR}/hover"
+mkdir -p "${dir}"
+
+# Builds before the layout changed asked for a game/hover subdirectory. The
+# host still finds it (game is tried first), so leave an existing one alone.
+old="${dir}/game/hover"
+
+if [ ! -f "${dir}/README.txt" ]; then
+    cat > "${dir}/README.txt" <<'EOM'
+Hover! reads its files from this directory.
+
+Copy your own, legally obtained copy of the game here: HOVER.EXE first (the
+recompiled host still maps it for its dialogs, icons and strings, and binds
+the imports against it), and beside it the files the game reads at runtime:
+
+    HOVER.EXE       required: the original game image
+    DASHRES.DLL     required: resources (dialogs, bitmaps, sounds)
+    MAZES/          required: MAZE1.MAZ ... and the textures
+    SOUNDS/         required: WAV and MIDI files
+    HOVER.HLP       optional: the help file
+    HOVRREAD.TXT    optional: the original readme
+
+The game runs only from files you provide; none are shipped in this
+AppImage. The project's README ("What is not in this repo") explains why.
+EOM
+fi
+
+if [ -f "${dir}/HOVER.EXE" ]; then
+    :
+elif [ -f "${old}/HOVER.EXE" ]; then
+    echo "hover: using the game files in ${old}/" >&2
+    echo "  (moving them up to ${dir}/ also works)" >&2
+elif [ -f "${dir}/game/HOVER.EXE" ]; then
+    echo "hover: using the game files in ${dir}/game/" >&2
+    echo "  (moving them up to ${dir}/ also works)" >&2
+else
+    echo "hover: no HOVER.EXE in ${dir}/ yet." >&2
+    echo "  Copy your copy of the game there first (see README.txt)." >&2
+fi
+
+if ! cd "${dir}"; then
+    echo "hover: cannot enter ${dir}; not starting there" >&2
+    echo "  (mkdir -p should have made it; check that HOME is writable)" >&2
+    exit 1
+fi
+
+# Launched from a file manager there are no arguments, and the host's default
+# is a dry run (map, bind and stop). Start the game by default; --help and the
+# selftests still take precedence in the host's argument parsing.
+set -- --run "$@"

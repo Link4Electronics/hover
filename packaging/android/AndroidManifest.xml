@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android app identity and entry point for the APK that
+  packaging/bundle-android.sh assembles (no Gradle: the bundler drives
+  aapt/d8/zipalign/apksigner directly, see that script's header).
+
+  package="com.hover.game" is permanent: Android treats a changed package
+  name plus an unchanged signing certificate as a different app, so changing
+  it after a release would strand every install.
+
+  versionName/versionCode are substituted by the bundler (versionCode) and
+  resolved from res/values/strings.xml (versionName), which it generates; the
+  literals here keep the manifest valid to read and to build by hand.
+
+  The activity is SDL's stock org.libsdl.app.SDLActivity. It dlopens
+  libmain.so (the bundler renames libhover.so to that) and calls the SDL_main
+  that src/hle/main.c exports. No subclass is needed because nothing has to
+  be overridden (SDLActivity.getArguments() already returns no arguments,
+  which is what main()'s argument parser expects: it rejects anything it does
+  not know).
+
+  Game data: the host looks for the game folder next to nothing -- it looks
+  in the app's own external files directory (src/hle/main.c's Android
+  fallback), which needs no storage permission:
+  /sdcard/Android/data/com.hover.game/files/game/hover/. Copy the original
+  game's files there (HOVER.EXE, DASHRES.DLL, MAZES/, SOUNDS/); none ship in
+  the APK.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hover.game"
+    android:versionCode="1"
+    android:versionName="@string/version_name"
+    android:installLocation="auto">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <application android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true"
+        android:hasCode="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+        android:extractNativeLibs="false">
+
+        <!-- sensorLandscape, not portrait or unlocked: the game renders one
+             4:3 landscape screen and has no portrait layout. configChanges
+             keeps SDLActivity alive across the rotations it does handle. -->
+        <activity android:name="org.libsdl.app.SDLActivity"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|uiMode"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:alwaysRetainTaskState="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

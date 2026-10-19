@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hover!
+Comment=Static recompilation of the 1995 game "Hover!": capture the flag in a hovercraft maze
+Exec=hover
+Icon=hover
+Terminal=false
+Categories=Game;ActionGame;
+Keywords=Hover;hovercraft;recompilation;capture the flag;
+StartupWMClass=hover

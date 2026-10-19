@@ -1,7 +1,6 @@
 /* Xbox controller support: pad.c. */
 #pragma once
-#include <windows.h>
-#include <xinput.h>
+#include "hover_port.h"
 
 void pad_start(const char* ini, HWND frame);   /* load [pad], start polling */
 int  pad_held(int vk);                         /* is the pad holding this key? */

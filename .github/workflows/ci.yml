@@ -1,39 +1,729 @@
-# What CI can check without the game (which is never in the repo): the Python
-# tools compile, the conformance harness takes its no-corpus path, and the host
-# (host.c against pcrecomp's native32) compiles for x86 with warnings as
-# errors. Linking needs the generated C, which only a local run of the
-# pipeline on your own copy produces.
-name: ci
+# CI for the portable host (macOS, Windows, Android, and Linux through the
+# AppImage job). The Windows leg builds the original 32-bit host on pcrecomp's
+# native32 runtime; the others build on win32hle + SDL2.
+#
+# The workflow runs on tag pushes and manual dispatch only: ordinary commits
+# and pull requests do not trigger it. Every run compiles the host, runs the
+# selftests and uploads the workflow artifacts; a tag push, or a dispatch that
+# names a tag in its input, also packages and publishes a GitHub Release under
+# that tag (created at the dispatched commit when it does not exist yet).
+#
+# Packages are: Linux AppImage (+ .zsync), Android APK (arm64-v8a and
+# armeabi-v7a), Windows zip, macOS zip.
+#
+# No package carries any game data: the player supplies the original files
+# (the README in each package says where). src/recomp/gen is recompiler output
+# and is not committed (REPO_RULES section 3); when it is absent the build
+# configures with -DHOVER_GEN_STUB=ON so the host still compiles, but the game
+# itself only runs once the lifted code is present in src/recomp/gen.
+#
+# pcrecomp is checked out beside the sources. By default that is
+# sp00nznet/pcrecomp@main; set the PCRECOMP_REPOSITORY / PCRECOMP_REF
+# variables to use a fork (for example while a win32hle fix is still a PR).
+# tools/pcrecomp-winhle.patch carries hover's two win32hle runtime fixes
+# (resize to the game's primary window, and no synthesized paint/timer for a
+# window being destroyed); it is applied only when the checked-out pcrecomp
+# does not already have them, and can be deleted once they are upstream.
+name: CI
+
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - '[0-9]*'
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish the release under (created at the dispatched commit if absent). Leave empty to only upload workflow artifacts.'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: windows-latest
+  # ---------------------------------------------------------------------------
+  # The compile gate: macOS (Apple clang) and the original Windows host (MSVC
+  # x86 + native32). Every leg uploads the binary it built; on tags and
+  # dispatch the macOS and Windows legs also package zips.
+  #
+  # No plain Linux leg: packaging/make-appimage.sh in the appimage job below
+  # is the Linux build, exactly like carpocalypse2's ci.yml. Running gcc on
+  # ubuntu-latest here as well only duplicated that leg.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "CI ${{ matrix.platform.name }}"
+    runs-on: "${{ matrix.platform.os }}"
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - name: Fetch hover sources
+        uses: actions/checkout@v6
+
+      - name: Fetch pcrecomp
+        uses: actions/checkout@v6
         with:
-          repository: sp00nznet/pcrecomp
-          # ponytail: pinned to the jump-table fix until it merges; main after.
-          ref: fix/generate-jump-table-self-arm
+          repository: ${{ vars.PCRECOMP_REPOSITORY || 'sp00nznet/pcrecomp' }}
+          ref: ${{ vars.PCRECOMP_REF || 'main' }}
           path: pcrecomp
-      - uses: actions/setup-python@v5
+
+      - name: Apply hover's win32hle patch (until it is upstream)
+        run: |
+          set -euo pipefail
+          cd pcrecomp
+          if grep -q hle_primary_window_size runtime/win32hle/win32hle.h; then
+            echo "pcrecomp already carries hover's win32hle changes"
+          else
+            git apply --verbose "$GITHUB_WORKSPACE/tools/pcrecomp-winhle.patch"
+          fi
+
+      # -- Toolchain -------------------------------------------------------
+      - name: Install SDL2 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config sdl2 sdl2_ttf
+
+      # -- Python tools, same checks the old Windows-only workflow had ------
+      # They live on the Windows leg now that the Linux one is gone: they are
+      # OS-independent, and this is where the pre-CMake workflow ran them.
+      - name: Set up Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Python compiles
+        if: runner.os == 'Windows'
         run: python -m py_compile run_lift.py tools/catalog.py tools/conformance.py tools/gamefiles.py tools/addr2line.py
+
       - name: Conformance (skips without the game)
+        if: runner.os == 'Windows'
         run: python tools/conformance.py
+
       - name: generate.py self-test (the lifter this game needs)
+        if: runner.os == 'Windows'
         run: |
-          pip install capstone pefile
+          python -m pip install --disable-pip-version-check capstone pefile
           python pcrecomp/tools/lift/generate.py --selftest
-      - uses: ilammy/msvc-dev-cmd@v1
+
+      # -- Build -------------------------------------------------------------
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DHOVER_GEN_STUB=ON \
+            -DPCRECOMP="${{ github.workspace }}/pcrecomp"
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: cmake --build build
+
+      - name: Self-tests (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          ./build/hover --pad-selftest
+          ./build/hover --levels-selftest
+          ./build/hover --net-selftest
+
+      # Ninja + the MSVC developer environment rather than a Visual Studio
+      # generator: windows-latest stopped shipping the VS 2022 generator that
+      # this workflow used to name, and vcvarsall still gives a 32-bit cl.
+      - name: Set up MSVC (x86)
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
           arch: x86
-      - name: host, pad, presenter and levels compile (x86, /W3 /WX)
-        run: cl /nologo /c /W3 /WX /D_CRT_SECURE_NO_WARNINGS /Isrc/runtime /Ipcrecomp/runtime/native32 /Ipcrecomp/runtime/recomp32 src/runtime/host.c src/runtime/pad.c src/runtime/present.c src/runtime/levels.c src/runtime/mp.c src/runtime/net.c
+
+      - name: Configure (MSVC x86)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DHOVER_GEN_STUB=ON `
+            -DPCRECOMP="${{ github.workspace }}/pcrecomp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build (MSVC x86)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The old Windows-only workflow could not link and used this to keep the
+      # host sources warning-free. The CMake build supersedes it, but /W3 alone
+      # still lets a warning through, so keep the gate on the same six files
+      # (pcrecomp's headers stay out of it: /WX there is not ours to enforce).
+      - name: Host sources are warning-free (x86, /W3 /WX)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $obj = Join-Path $env:RUNNER_TEMP 'warncheck'
+          New-Item -ItemType Directory -Force $obj | Out-Null
+          Push-Location $obj
+          cl /nologo /c /W3 /WX /D_CRT_SECURE_NO_WARNINGS `
+            /I"$env:GITHUB_WORKSPACE\src\port" `
+            /I"$env:GITHUB_WORKSPACE\src\runtime" `
+            /I"$env:GITHUB_WORKSPACE\pcrecomp\runtime\native32" `
+            /I"$env:GITHUB_WORKSPACE\pcrecomp\runtime\recomp32" `
+            "$env:GITHUB_WORKSPACE\src\runtime\host.c" `
+            "$env:GITHUB_WORKSPACE\src\runtime\pad.c" `
+            "$env:GITHUB_WORKSPACE\src\runtime\present.c" `
+            "$env:GITHUB_WORKSPACE\src\runtime\levels.c" `
+            "$env:GITHUB_WORKSPACE\src\runtime\mp.c" `
+            "$env:GITHUB_WORKSPACE\src\runtime\net.c"
+          $code = $LASTEXITCODE
+          Pop-Location
+          exit $code
+
+      # -- Build artifacts: every run -----------------------------------------
+      # The runner context's arch is GitHub's spelling (X64/ARM64); these names
+      # use the same ones the packaging steps do.
+      - name: Upload macOS build
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hover-macos-${{ runner.arch == 'ARM64' && 'arm64' || 'x86_64' }}
+          path: build/hover
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Windows build
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hover-windows-x86_64
+          path: build/hover.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      # -- Zip packaging: tags and manual dispatch only -----------------------
+      - name: Bundle Windows zip
+        if: ${{ runner.os == 'Windows' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'dist/hover-windows-x86_64'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item build/hover.exe $stage/
+          Copy-Item LICENSE $stage/
+          Copy-Item NOTICE $stage/
+          @(
+            'Hover! (static recompilation) - Windows x64 host, 32-bit game code'
+            ''
+            'This archive ships no original Hover! files (see the project'
+            'README, "What is not in this repo"). Extract it, copy the files'
+            'from your own copy of the game into game\hover\ next to'
+            'hover.exe (HOVER.EXE, DASHRES.DLL, MAZES\, SOUNDS\, ...), and'
+            'run:'
+            ''
+            '    hover.exe --run'
+            ''
+            'The recompiled host maps HOVER.EXE for the game resources and'
+            'binds its imports against it, so HOVER.EXE is required at run'
+            'time even though none of its code runs from there.'
+          ) | Set-Content -Encoding Ascii (Join-Path $stage 'README.txt')
+          Compress-Archive -Force -Path $stage -DestinationPath 'dist/hover-windows-x86_64.zip'
+
+      - name: Bundle macOS zip
+        if: ${{ runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        id: pkg
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          echo "arch=${arch}" >> "$GITHUB_OUTPUT"
+          stage="dist/hover-macos-${arch}"
+          mkdir -p "$stage"
+          cp build/hover "$stage/"
+
+          # Bundle the dependency closure of every non-system dylib: Homebrew's
+          # SDL2 and SDL2_ttf pull freetype/harfbuzz and friends out of the
+          # Cellar, and a zip that only carries the executable runs solely on
+          # a Mac with the same brew prefix. Each reference is repointed at
+          # the copy next to it; copied libraries are queued again because
+          # they carry references of their own.
+          queue=("$stage/hover")
+          copied=" "
+          while [ "${#queue[@]}" -gt 0 ]; do
+            f="${queue[0]}"
+            queue=("${queue[@]:1}")
+            while IFS= read -r ref; do
+              case "$ref" in
+                /opt/homebrew/*|/usr/local/*)
+                  base="$(basename "$ref")"
+                  case "$copied" in
+                    *" ${base} "*) ;;
+                    *)
+                      cp -L "$ref" "$stage/$base"
+                      chmod u+w "$stage/$base"
+                      copied="${copied}${base} "
+                      queue+=("$stage/$base")
+                      ;;
+                  esac
+                  install_name_tool -change "$ref" "@executable_path/$base" "$f"
+                  ;;
+              esac
+            done < <(otool -L "$f" | awk 'NR > 1 { print $1 }')
+          done
+
+          # Nothing may still point into the build machine's homebrew prefix.
+          if otool -L "$stage/hover" "$stage"/*.dylib | grep -E '/(opt/homebrew|usr/local)/'; then
+            echo "unbundled Homebrew reference remains in the staged files" >&2
+            exit 1
+          fi
+
+          cp LICENSE NOTICE "$stage/"
+          cat > "$stage/README.txt" <<'EOF'
+          Hover! (static recompilation) - macOS host
+
+          This archive ships no original Hover! files (see the project
+          README, "What is not in this repo"). Extract it, copy the files
+          from your own copy of the game into game/hover/ next to the
+          hover executable (HOVER.EXE, DASHRES.DLL, MAZES/, SOUNDS/, ...),
+          and run:
+
+              ./hover --run
+
+          The recompiled host maps HOVER.EXE for the game resources and
+          binds its imports against it, so HOVER.EXE is required at run
+          time even though none of its code runs from there.
+
+          The binary is unsigned: if macOS refuses to open it, right-click
+          hover and choose Open.
+          EOF
+          (cd dist && zip -qry "hover-macos-${arch}.zip" "hover-macos-${arch}")
+
+      - name: Upload Windows artifact
+        if: ${{ runner.os == 'Windows' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Upload macOS artifact
+        if: ${{ runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-${{ steps.pkg.outputs.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Android: cross-build against Bionic, so it brings its own toolchain
+  # resolution and builds SDL2 + SDL2_ttf from source per ABI into a cached
+  # prefix. Every run compiles; tag pushes and dispatches also bundle a
+  # signed APK (packaging/bundle-android.sh; no Gradle: aapt, javac/d8,
+  # zipalign and apksigner straight from the SDK).
+  # The APK ships no game data: the host looks in the app's external files
+  # directory, and the player copies their files there.
+  # ---------------------------------------------------------------------------
+  android:
+    name: "CI Android ${{ matrix.abi }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: "arm64-v8a" }
+          - { abi: "armeabi-v7a" }
+    env:
+      SDL2_TAG: release-2.32.10
+      SDL2_TTF_TAG: release-2.24.0
+      ANDROID_API: '24'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch hover sources
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # versionCode is the commit count
+
+      - name: Fetch pcrecomp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PCRECOMP_REPOSITORY || 'sp00nznet/pcrecomp' }}
+          ref: ${{ vars.PCRECOMP_REF || 'main' }}
+          path: pcrecomp
+
+      - name: Apply hover's win32hle patch (until it is upstream)
+        run: |
+          set -euo pipefail
+          cd pcrecomp
+          if grep -q hle_primary_window_size runtime/win32hle/win32hle.h; then
+            echo "pcrecomp already carries hover's win32hle changes"
+          else
+            git apply --verbose "$GITHUB_WORKSPACE/tools/pcrecomp-winhle.patch"
+          fi
+
+      - name: Resolve the NDK
+        id: ndk
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$ndk" ]; then
+            root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+            ndk="$(ls -d "$root"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "no Android NDK found (ANDROID_NDK_LATEST_HOME unset, nothing under the SDK)" >&2
+            exit 1
+          fi
+          echo "ndk=${ndk}" >> "$GITHUB_OUTPUT"
+          echo "using NDK ${ndk}"
+
+      # The Java side of SDL (android-project/) exists only in the source
+      # tree, not in the install prefix, so it is fetched on cache hits too.
+      - name: Fetch SDL2 sources
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if git clone --depth 1 --branch "$SDL2_TAG" \
+                https://github.com/libsdl-org/SDL.git sdl2-src; then
+              break
+            fi
+            rm -rf sdl2-src
+            echo "SDL2 clone attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          test -d sdl2-src
+
+      - name: Cache the SDL2 prefix (${{ matrix.abi }})
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: sdl-prefix
+          key: sdl2-${{ matrix.abi }}-${{ env.SDL2_TAG }}-${{ env.SDL2_TTF_TAG }}
+
+      - name: Build SDL2 + SDL2_ttf (${{ matrix.abi }})
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ndk="${{ steps.ndk.outputs.ndk }}"
+          tc="${ndk}/build/cmake/android.toolchain.cmake"
+          prefix="$PWD/sdl-prefix"
+
+          cmake -S sdl2-src -B sdl2-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${tc}" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${prefix}" \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF
+          cmake --build sdl2-build -j"$(nproc)"
+          cmake --install sdl2-build
+
+          # SDL2TTF_VENDORED builds freetype and harfbuzz from external/,
+          # which are git submodules; without them the configure step fails
+          # with "No harfbuzz sources found".
+          for attempt in 1 2 3; do
+            if git clone --depth 1 --branch "$SDL2_TTF_TAG" \
+                --recurse-submodules --shallow-submodules \
+                https://github.com/libsdl-org/SDL_ttf.git sdl2ttf-src; then
+              break
+            fi
+            rm -rf sdl2ttf-src
+            echo "SDL2_ttf clone attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          test -d sdl2ttf-src/external/freetype
+          test -d sdl2ttf-src/external/harfbuzz
+
+          # The NDK toolchain defaults CMAKE_FIND_ROOT_PATH_MODE_* to ONLY,
+          # which restricts find_package/find_library to the NDK sysroot and
+          # hides the SDL2 install in ${prefix}. BOTH keeps the cross-build
+          # re-rooting and also searches explicit prefixes.
+          cmake -S sdl2ttf-src -B sdl2ttf-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${tc}" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${prefix}" \
+            -DCMAKE_PREFIX_PATH="${prefix}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DSDL2TTF_VENDORED=ON -DSDL2TTF_SAMPLES=OFF
+          cmake --build sdl2ttf-build -j"$(nproc)"
+          cmake --install sdl2ttf-build
+
+      - name: Configure hover (${{ matrix.abi }})
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHOVER_GEN_STUB=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/sdl-prefix" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DPCRECOMP="${{ github.workspace }}/pcrecomp" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+
+      - name: Build hover (${{ matrix.abi }})
+        run: cmake --build build
+
+      # -- Build artifacts: every run -----------------------------------------
+      # The shared library the APK bundler renames to libmain.so, uploaded
+      # as-is. It needs the SDL2 .so files from the cached prefix next to it
+      # to load.
+      - name: Upload Android build (${{ matrix.abi }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: hover-android-${{ matrix.abi }}
+          path: build/libhover.so
+          if-no-files-found: error
+          retention-days: 7
+
+      # -- APK packaging: tags and manual dispatch only -----------------------
+      - name: Set up Java (APK)
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Retried and bounded: a stalled Google endpoint returns no error for a
+      # retry count to catch and no wall clock of its own, so without both it
+      # goes quiet until the job timeout cancels the leg with nothing in the
+      # log.
+      - name: Install Android SDK packaging tools
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager="$(command -v sdkmanager || true)"
+          if [ -z "${sdkmanager}" ]; then
+            sdkmanager="${sdk}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          if [ ! -x "${sdkmanager}" ]; then
+            echo "no sdkmanager at ${sdkmanager}" >&2
+            exit 1
+          fi
+          yes | "${sdkmanager}" --licenses > /dev/null 2>&1 || true
+          for attempt in 1 2 3; do
+            if timeout -k 30 600 "${sdkmanager}" --install \
+                "platforms;android-35" "build-tools;35.0.0" > /dev/null 2>&1; then
+              exit 0
+            fi
+            if [ "${attempt}" = 3 ]; then
+              echo "sdkmanager install failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "sdkmanager attempt ${attempt} failed; retrying in 10s"
+            sleep 10
+          done
+
+      - name: Bundle APK (${{ matrix.abi }})
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        env:
+          HOVER_ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          HOVER_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          HOVER_ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+          HOVER_ANDROID_EXPECT_CERT: ${{ vars.ANDROID_EXPECT_CERT }}
+          HOVER_ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          version="$(git describe --tags --always)"
+          version_code="$(git rev-list --count HEAD)"
+          mkdir -p dist
+
+          # Release key, when the repository has one: the secret is the
+          # base64 of the .jks, decoded here because the bundler takes a path.
+          # Without it the bundler debug-signs and says so.
+          if [ -n "${HOVER_ANDROID_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "${HOVER_ANDROID_KEYSTORE_BASE64}" | base64 -d > "${RUNNER_TEMP}/release.jks"
+            export HOVER_ANDROID_KEYSTORE="${RUNNER_TEMP}/release.jks"
+          fi
+
+          bash packaging/bundle-android.sh \
+            --lib build/libhover.so \
+            --version "${version}" \
+            --version-code "${version_code}" \
+            --arch "${{ matrix.abi }}" \
+            --build-dir build \
+            --sdk-root "${sdk}" \
+            --sdl2-java-src "$PWD/sdl2-src" \
+            --sdl2-lib-dir "$PWD/sdl-prefix/lib" \
+            --output-dir dist
+
+      - name: Upload APK artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-${{ matrix.abi }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The Linux release, as an AppImage only. An Arch container for a fixed
+  # userspace, pkgforge's anylinux toolchain (quick-sharun bundles the
+  # libraries, its appimagetool writes the image and the .zsync), and a
+  # monolithic packaging/make-appimage.sh that installs the distro SDL2,
+  # builds, and stages the AppDir. Nothing from the original game goes inside
+  # (the AppRun hook stages a per-user game directory and tells the player
+  # what to copy there).
+  #
+  # This is the only Linux build in the workflow -- the plain Linux matrix
+  # leg was removed in its favour, as in carpocalypse2's ci.yml.
+  # ---------------------------------------------------------------------------
+  appimage:
+    name: "AppImage ${{ matrix.arch }}"
+    runs-on: "${{ matrix.runs-on }}"
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runs-on: ubuntu-latest, arch: x86_64 }
+          - { runs-on: ubuntu-24.04-arm, arch: aarch64 }
+    container: ghcr.io/pkgforge-dev/archlinux:latest
+    defaults:
+      run:
+        shell: sh
+    steps:
+      # Before checkout: actions/checkout needs git in PATH for its work, and
+      # the bare Arch container does not carry it.
+      - uses: pkgforge-dev/anylinux-setup-action@v2
+
+      - name: Fetch hover sources
+        uses: actions/checkout@v6
+
+      - name: Fetch pcrecomp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PCRECOMP_REPOSITORY || 'sp00nznet/pcrecomp' }}
+          ref: ${{ vars.PCRECOMP_REF || 'main' }}
+          path: pcrecomp
+
+      - name: Apply hover's win32hle patch (until it is upstream)
+        run: |
+          set -eu
+          cd pcrecomp
+          if grep -q hle_primary_window_size runtime/win32hle/win32hle.h; then
+            echo "pcrecomp already carries hover's win32hle changes"
+          else
+            git apply --verbose "$GITHUB_WORKSPACE/tools/pcrecomp-winhle.patch"
+          fi
+
+      # The checkout was made by the runner, so inside the container its
+      # files are owned by a different uid, which git reports as dubious
+      # ownership. make-appimage.sh runs `git rev-parse` for the version.
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The script pulls from Arch mirrors and downloads appimagetool from a
+      # GitHub release; both have failed a leg outright when upstream
+      # returned 5xx. Retry the whole script rather than any one fetch:
+      # pacman and the CMake build are both incremental, so a second attempt
+      # costs seconds, and appimagetool's own retries are already exhausted
+      # by then.
+      - name: Make AppImage
+        env:
+          # The checkout has no src/recomp/gen (it is generated from the
+          # player's game, which CI does not have). Package the stub so the
+          # AppImage build and its hooks are still checked; the artifact
+          # cannot run the game until it is rebuilt from a local tree.
+          HOVER_ALLOW_STUB: 1
+        run: |
+          set -eu
+          export PCRECOMP="$GITHUB_WORKSPACE/pcrecomp"
+          for attempt in 1 2 3; do
+            # Start each attempt from a clean AppDir: a run that died inside
+            # quick-sharun leaves a half-populated tree behind, and the next
+            # attempt would then fail on that rather than on the real cause.
+            rm -rf ./AppDir ./dist
+            if /bin/sh ./packaging/make-appimage.sh; then
+              exit 0
+            fi
+            echo "AppImage build attempt ${attempt} failed; retrying in 15s"
+            sleep 15
+          done
+          echo "AppImage build failed after 3 attempts" >&2
+          exit 1
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppImage-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Attach what the release legs produced to a GitHub Release. Runs for tag
+  # pushes and for dispatches that name a tag in their input: the input is
+  # what makes a run off a branch releasable, because a release must never
+  # take its name from the branch (when the tag is absent, softprops creates
+  # it at the dispatched commit). A dispatch without the input only uploads
+  # the workflow artifacts. softprops is idempotent -- creates the release if
+  # absent, attaches or replaces the assets if present -- so re-running a
+  # failed run lands on the same release instead of fighting it.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Attach to GitHub Release
+    needs: [build, android, appimage]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.android.result == 'success' && needs.appimage.result == 'success' && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')) }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download AppImage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: AppImage-*
+          path: artifacts/appimage
+          merge-multiple: true
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Android-*
+          path: artifacts/android
+          merge-multiple: true
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Windows-*
+          path: artifacts/windows
+          merge-multiple: true
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macOS-*
+          path: artifacts/macos
+          merge-multiple: true
+
+      # Only the packages: the AppImage artifacts also carry VERSION.txt,
+      # which has no business on a release page (the release is named after
+      # the tag, not after the hash inside).
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/appimage/**/*.AppImage
+            artifacts/appimage/**/*.zsync
+            artifacts/android/**/*.apk
+            artifacts/windows/**/*.zip
+            artifacts/macos/**/*.zip
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true

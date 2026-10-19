@@ -1,6 +1,6 @@
 /* Online play, lockstep over UDP: net.c. */
 #pragma once
-#include <windows.h>
+#include "hover_port.h"
 #include <stdint.h>
 
 void net_init(const char* ini, HWND frame, int headless);
